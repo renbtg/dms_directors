@@ -1,0 +1,47 @@
+# Compiled source #
+###################
+*.com
+*.class
+*.app
+
+# Packages #
+############
+# it's better to unpack these files and commit the raw source
+# git has its own built in compression methods
+*.7z
+*.gz
+*.jar
+*.rar
+*.tar
+*.zip
+*.bck
+
+# Logs and databases #
+######################
+*.log
+# TODO rbattaglia - maymore more, like redis, RocksDB etc.
+*.sqlite
+
+# IDE generated files #
+###########################
+*.classpath
+*.project
+*.settings
+*.idea
+*.swp
+*.iml
+*.ipr
+*.iws
+.idea/
+.vscode/
+
+# Build specific folders #
+##########################
+=======
+.project
+.gradle
+.settings
+.classpath
+target/
+dist/
+
