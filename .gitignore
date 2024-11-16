@@ -19,8 +19,6 @@
 # Logs and databases #
 ######################
 *.log
-# TODO rbattaglia - maymore more, like redis, RocksDB etc.
-*.sqlite
 
 # IDE generated files #
 ###########################

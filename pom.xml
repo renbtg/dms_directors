@@ -39,6 +39,16 @@
                 <artifactId>maven-dependency-plugin</artifactId>
                 <version>3.5.0</version>
             </plugin>
+
+            <plugin>
+                <groupId>org.flywaydb</groupId>
+                <artifactId>flyway-maven-plugin</artifactId>
+                <version>10.17.0</version>
+                <configuration>
+                    <user>databaseUser</user>
+                    <password>databasePassword</password>
+                </configuration>
+            </plugin>
         </plugins>
     </build>
     <repositories>
@@ -121,5 +131,30 @@
             <artifactId>commons-collections4</artifactId>
             <version>4.4</version>
         </dependency>
+
+
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+
+
+
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+            <version>8.5.12</version>
+            <scope>provided</scope>
+        </dependency>
+
     </dependencies>
+
+
 </project>

@@ -17,6 +17,8 @@ import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
 import java.time.Duration;
 import java.time.temporal.ChronoUnit;
+import java.util.Date;
+import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -27,6 +29,10 @@ import java.util.concurrent.TimeUnit;
 @RequiredArgsConstructor
 public class DataLoader implements ApplicationListener<ApplicationReadyEvent> {
     private final DataInfo dataInfo;
+    private final H2DbService h2DbService;
+
+    @Value("${populardirectors.enable_persistence}")
+    private boolean enablePersistence;
 
     @Value("${populardirectors.maxthreads}")
     private int maxThreads;
@@ -40,20 +46,14 @@ public class DataLoader implements ApplicationListener<ApplicationReadyEvent> {
     @Value("${populardirectors.abort_on_pagefetch_timeout}")
     private boolean abortOnPageFetchTimeout;
 
-/*
-    @Override
-    public void run(String... args) {
-        log.info("BeforeAcceptTraffic.run(...) started");
-
+    private final Thread t = new Thread(() -> {
+        log.info("Will call method fetchData()");
         fetchData();
-    }
-*/
-    private Thread t = new Thread(() -> {
-        fetchData();
+        log.info("Did call method fetchData()");
     });
     @Override
     public void onApplicationEvent(ApplicationReadyEvent event) {
-        // ??? RBATTAGLIA - why check THReAD.isAlive() HEre ???
+        // TODO - any need to check THReAD.isAlive() HEre ???
         if (!t.isAlive()) {
             t.start();
         }
@@ -62,17 +62,58 @@ public class DataLoader implements ApplicationListener<ApplicationReadyEvent> {
     public void fetchData() {
         PageDTO firstPage = fetchPage(1, -1);
         if (firstPage == null) {
-            log.error("Could not fetch the first page - nothing to do");
+            setNonRecoverableError("Could not fetch the first page - nothing to do");
             return;
         }
         if (firstPage.getTotalPages() == 1) {
-            // TODO rbattaglia now: set "done=true" somehow
+            if (enablePersistence) {
+                h2DbService.truncateAll();
+                PageEntity pageEntity = new PageEntity(firstPage);
+                h2DbService.savePage(pageEntity);
+            }
+            dataInfo.getFetchesAllDone().set(true); // DONE set to TRUE even when errors/incompletion found
             return;
         }
-        for (int p = 2; p <= firstPage.getTotalPages(); p++) {
-            dataInfo.getPagesNotFetched().add(p); // has to be mutable List ! ;
+
+        if (enablePersistence) {
+            PageDTO firstPageEntity = h2DbService.getPage(1);
+            if (firstPageEntity != null) {
+                if (firstPageEntity.getTotalPages() != firstPage.getTotalPages() ||
+                        firstPageEntity.getPerPage() != firstPage.getPerPage()) {
+                    log.info("external endpoint JSON structure changed, need to refetch it all");
+                    h2DbService.truncateAll();
+                    PageEntity rebuiltPageEntity = new PageEntity(firstPage);
+                    h2DbService.savePage(rebuiltPageEntity);
+                }
+            } else {
+                PageEntity rebuiltFirstPageEntity = new PageEntity(firstPage);
+                // DB-save the previosçy non-existing first page
+                h2DbService.savePage(rebuiltFirstPageEntity);
+            }
         }
-        int nofThreadsToUse = Math.min(firstPage.getTotalPages(), maxThreads);
+        List<Integer> persistedPages = enablePersistence ? h2DbService.getPageIDs() : List.of(1);
+        dataInfo.getPagesNotFetched().clear();
+
+        for (int p = 2; p <= firstPage.getTotalPages(); p++) {
+            if (! persistedPages.contains(p)) {
+                dataInfo.getPagesNotFetched().add(p); // has to be mutable List ! ;
+            } else {
+                // SHORTCUT: add directors of pages already_previously_successfully_fetched
+                final PageDTO pageDTO = h2DbService.getPage(p);
+                dataInfo.getAllFetchedDirectors().addAll(pageDTO.getData().stream().
+                        map(MovieDTO::getDirector).toList());
+                log.info("Added {} DB-fetched directors to allFetchedDirectors (from page {}} ",
+                        pageDTO.getData().size(), p);
+            }
+        }
+        if (dataInfo.getPagesNotFetched().isEmpty()) {
+            // all pages have already been successfully fetched and saved previously, JUST RETURN, we have it all
+            log.info("dataInfo.getPagesNotFetched() is empty, all is already loaded, returning early");
+            dataInfo.getFetchesAllDone().set(true);
+            return;
+        }
+
+        int nofThreadsToUse = Math.min(dataInfo.getPagesNotFetched().size(), maxThreads);
         if (nofThreadsToUse * firstPage.getPerPage() > maxMoviesInMemory) {
             nofThreadsToUse = maxMoviesInMemory / firstPage.getPerPage();
         }
@@ -85,24 +126,28 @@ public class DataLoader implements ApplicationListener<ApplicationReadyEvent> {
                     log.info("thread {} of {} started", finalCurrThreadNum, finalNofThreadsToUse);
                     int myPage;
                     while (true) {
-                        // TODO rbattaglia - break_all IF we got FORMAT_CHANGED page? nofPages, nofMovies DIFFERENT?
-                        // TODO rbattaglia - fastest way to kill all running threads? Send an INTERRUPT signal?
-                        // TODO rbattaglia - how would Controller class tell STILL_FETCHING threads/loops that it needs to reinitialize itself?
                         myPage = getUnfetchedPage(finalCurrThreadNum);
                         log.info("thread {} of {} running, myPage={}", finalCurrThreadNum, finalNofThreadsToUse, myPage);
                         if (myPage == -1) {
+                            // -1 means "it seems there's no page for current thread, we're close to done,
                             break;
                         }
 
-                        // -1 means "it seems there's no page for you, we're close to done,
-                        // maybe other threads already doint all remaining pages"
-                        fetchPage(myPage, finalCurrThreadNum);
+                        PageDTO pageFetched = fetchPage(myPage, finalCurrThreadNum);
+                        if (enablePersistence) {
+                            h2DbService.savePage(new PageEntity(pageFetched));
+                        }
                     }
                 });
             }
             //executor.shutdown();
             try {
-                boolean terminated = executor.awaitTermination(1, TimeUnit.HOURS); // TODO rbattaglia - TOtAL REVAMP of the WAITING logic here
+                executor.shutdown();
+
+                log.info("Now is {}, WILL do executor.awaitTermination", new Date());
+                boolean terminated = executor.awaitTermination((firstPage.getTotalPages()-1)*3, TimeUnit.SECONDS);
+                log.info("Now is {}, DID do executor.awaitTermination", new Date());
+
                 if (! terminated) {
                     setNonRecoverableError("ExecutorService.awaitTermination",
                             new RuntimeException("ExecutorService.awaitTermination - finished before terminating, took too long"));
@@ -110,8 +155,7 @@ public class DataLoader implements ApplicationListener<ApplicationReadyEvent> {
 
             } catch (InterruptedException e) {
                 setNonRecoverableError("InterruptedException awaiting executorService termination", e);
-                executor.shutdown();
-                // TODO rbattaglia - how to deal with too-long-fetching-data-from-external-HTTP-endpoint
+                executor.shutdown(); // TODO: OUCH, another shutdown here is innocuous or harmful, as it seems
             }
             dataInfo.getFetchesAllDone().set(true); // DONE set to TRUE even when errors/incompletion found
         }
@@ -131,18 +175,18 @@ public class DataLoader implements ApplicationListener<ApplicationReadyEvent> {
         return retVal;
     }
 
-    private PageDTO fetchPage(int page, int threadNum) {
+    private PageDTO fetchPage(int pageNum, int threadNum) {
         /*
-            TODO - needs to throw Exception(s) telling what went wrong, must be caught and shut down ExecutorService
+            TODO - strenghten, maybe more exception checking/throwing
         */
 
-        String requestURL = getMovieURL(page);
-        log.info("threadNum {} fetching page, requestURL={}", threadNum, requestURL);
+        String requestURL = getMovieURL(pageNum);
+        log.info("threadNum {} fetching pageNum, requestURL={}", threadNum, requestURL);
 
         int maxAttempts = 10; // maximum attempts, retried when TimedOut
         int millisWaitBetweenAttempts = 2000; // could maxAttempts and millis depend on other stats?
         for (int attempt=1; attempt <= maxAttempts && dataInfo.getNonRecoverableException().get()==null; attempt++) {
-            log.info("threadNum {} Will do fetching page {}, attempt {} of {}", threadNum, page, attempt, maxAttempts);
+            log.info("threadNum {} Will do fetching pageNum {}, attempt {} of {}", threadNum, pageNum, attempt, maxAttempts);
             try(HttpClient httpClient = HttpClient.newHttpClient()) {
                 HttpRequest request = HttpRequest.newBuilder()
                         .uri(new URI(requestURL))
@@ -152,39 +196,41 @@ public class DataLoader implements ApplicationListener<ApplicationReadyEvent> {
                 HttpResponse<String> response = httpClient
                         .send(request, HttpResponse.BodyHandlers.ofString());
                 ObjectMapper objectMapper = new ObjectMapper();
-                PageDTO pageDTO = objectMapper.readValue(response.body(), PageDTO.class);
-                for (MovieDTO movieDTO: pageDTO.getData()) {
-                    dataInfo.getAllFetchedDirectors().add(movieDTO.getDirector()); // TODO - one-step thread-safe "computeIfSomething WITH Adder"
-                }
-                log.info("threadNum {} OK fetching page {}, attempt {} of {}, duely got PageDTO and added its directors to allFetchedDirectors", threadNum, page, attempt, maxAttempts);
+                String responseBody = response.body();
+                PageDTO pageDTO = objectMapper.readValue(responseBody, PageDTO.class);
+                dataInfo.getAllFetchedDirectors().addAll(pageDTO.getData().stream().
+                        map(MovieDTO::getDirector).toList());
+                log.info("Added {} remote-url-fetched directors to allFetchedDirectors (from page {}} ",
+                        pageDTO.getData().size(), pageNum);
+                log.info("threadNum {} OK fetching pageNum {}, attempt {} of {}, duely got PageDTO", threadNum, pageNum, attempt, maxAttempts);
                 return pageDTO;
             } catch (URISyntaxException e) {
                 setNonRecoverableError("URI Syntax Exception", e);
             } catch (HttpTimeoutException e) {
                 if (attempt < maxAttempts) {
-                    log.error("HttpTimeoutException fetching page {}, attempt {} of {},will sleep {} milliseconds and retry", page, attempt, maxAttempts, millisWaitBetweenAttempts);
+                    log.error("HttpTimeoutException fetching pageNum {}, attempt {} of {},will sleep {} milliseconds and retry", pageNum, attempt, maxAttempts, millisWaitBetweenAttempts);
                     try {
                         Thread.sleep(millisWaitBetweenAttempts);
                     } catch (InterruptedException interruptedEx) {
 
-                        setNonRecoverableError(String.format("InterruptedException sleeping to retry fetching page %d attempt %d of %d, aborting...",
-                                page, attempt, maxAttempts), interruptedEx);
+                        setNonRecoverableError(String.format("InterruptedException sleeping to retry fetching pageNum %d attempt %d of %d, aborting...",
+                                pageNum, attempt, maxAttempts), interruptedEx);
                     }
                 } else {
-                    if (abortOnPageFetchTimeout || page == 1) {
-                        setNonRecoverableError(String.format("HttpTimeoutException fetching page %d, LAST attempt %d of %d, aborting...",
-                                page, attempt, maxAttempts), e);
+                    if (abortOnPageFetchTimeout || pageNum == 1) {
+                        setNonRecoverableError(String.format("HttpTimeoutException fetching pageNum %d, LAST attempt %d of %d, aborting...",
+                                pageNum, attempt, maxAttempts), e);
                     } else {
-                        log.error("HttpTimeoutException fetching page {}, attempt {} of {}, permanently ignoring page...",
-                                page, attempt, maxAttempts, e);
+                        log.error("HttpTimeoutException fetching pageNum {}, attempt {} of {}, permanently ignoring pageNum...",
+                                pageNum, attempt, maxAttempts, e);
                     }
                 }
             } catch (IOException e) {
-                setNonRecoverableError(String.format("IOException fetching page %d", page), e);
+                setNonRecoverableError(String.format("IOException fetching pageNum %d", pageNum), e);
             } catch (InterruptedException e) {
-                setNonRecoverableError(String.format("InterruptedException fetching page %d", page), e);
+                setNonRecoverableError(String.format("InterruptedException fetching pageNum %d", pageNum), e);
             } catch (Exception e) {
-                setNonRecoverableError(String.format("Exception fetching page %d", page), e);
+                setNonRecoverableError(String.format("Exception fetching pageNum %d", pageNum), e);
             }
 
         }
@@ -196,9 +242,13 @@ public class DataLoader implements ApplicationListener<ApplicationReadyEvent> {
         return baseMovieUrl + page;
     }
 
+    private void setNonRecoverableError(String errorMessage) {
+        log.error(errorMessage);
+        dataInfo.getNonRecoverableException().compareAndSet(null, new RuntimeException(errorMessage));
+    }
     private void setNonRecoverableError(String errorMessage, Exception e) {
         log.error(errorMessage, e);
-        dataInfo.getNonRecoverableException().compareAndSet(null, new Exception(errorMessage, e));
+        dataInfo.getNonRecoverableException().compareAndSet(null, new RuntimeException(errorMessage, e));
     }
 
 }
